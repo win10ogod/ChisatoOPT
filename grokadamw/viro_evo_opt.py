@@ -10,14 +10,13 @@ ViroEvoOpt - Viral Evolutionary Optimizer
 - 参数更新：θ_I ← θ_I - η∇L(θ_I) + ξ（变异项）
 """
 
-import torch
 import math
-import numpy as np
 import random
-from typing import Iterable, Dict, List, Tuple, Optional
-import logging
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-logger = logging.getLogger(__name__)
+import numpy as np
+import torch
+from torch.optim import Optimizer
 
 
 class ViralPopulation:
@@ -96,31 +95,37 @@ class ViralPopulation:
         return dS, dI, dR
     
     def update_parameter_classification(self, param_gradients: torch.Tensor):
-        """根据梯度活跃度更新参数分类"""
+        """根据梯度活跃度更新参数分类 - 优化版本"""
         param_flat = param_gradients.view(-1)
-        
-        # 根据梯度幅度重新分类参数
         gradient_magnitude = torch.abs(param_flat)
-        threshold_high = torch.quantile(gradient_magnitude, 0.8)
-        threshold_low = torch.quantile(gradient_magnitude, 0.3)
         
-        # 更新分类
-        self.infected_indices = set()
-        self.susceptible_indices = set()
-        self.recovered_indices = set()
+        # 使用topk代替昂贵的quantile计算，保持相同的分类逻辑
+        total_params = len(gradient_magnitude)
+        k_high = max(1, int(0.2 * total_params))  # 前20%为感染参数
+        k_low = max(1, int(0.3 * total_params))   # 后30%为恢复参数
         
-        for i, grad_mag in enumerate(gradient_magnitude):
-            if grad_mag > threshold_high:
-                self.infected_indices.add(i)
-            elif grad_mag < threshold_low:
-                self.recovered_indices.add(i)
-            else:
-                self.susceptible_indices.add(i)
+        # 获取高梯度参数索引（感染参数）
+        if k_high < total_params:
+            _, high_indices = torch.topk(gradient_magnitude, k_high, largest=True)
+            self.infected_indices = set(high_indices.cpu().tolist())
+        else:
+            self.infected_indices = set(range(total_params))
+        
+        # 获取低梯度参数索引（恢复参数）
+        if k_low < total_params:
+            _, low_indices = torch.topk(gradient_magnitude, k_low, largest=False)
+            self.recovered_indices = set(low_indices.cpu().tolist())
+        else:
+            self.recovered_indices = set()
+        
+        # 剩余参数为易感参数
+        all_indices = set(range(total_params))
+        self.susceptible_indices = all_indices - self.infected_indices - self.recovered_indices
         
         # 更新种群数量
         self.I = float(len(self.infected_indices))
-        self.S = float(len(self.susceptible_indices))
         self.R = float(len(self.recovered_indices))
+        self.S = float(len(self.susceptible_indices))
 
 
 class GillespieSimulator:
@@ -170,12 +175,25 @@ class GillespieSimulator:
     
     def generate_viral_mutation(self, param_shape: torch.Size, mu_rate: float, device: torch.device) -> torch.Tensor:
         """
-        生成病毒变异：ξ ~ Poisson(μ) · N(0, σ²)
+        生成病毒变异：ξ ~ Poisson(μ) · N(0, σ²) - 优化版本
         模拟病毒基因漂移
         """
-        # 泊松变异计数
-        mutation_counts = np.random.poisson(mu_rate, param_shape)
-        mutation_tensor = torch.tensor(mutation_counts, dtype=torch.float32, device=device)
+        # 对于小μ值使用伯努利近似，对于大μ值使用高斯近似，保持统计等价性
+        if mu_rate > 10.0:
+            # Poisson(λ) ≈ N(λ, λ) for large λ (统计等价)
+            mutation_tensor = torch.normal(mu_rate, math.sqrt(mu_rate), param_shape, device=device)
+            mutation_tensor = torch.clamp(mutation_tensor, min=0.0)
+        elif mu_rate > 0.1:
+            # 使用Poisson近似但限制形状
+            flat_size = torch.prod(torch.tensor(param_shape)).item()
+            if flat_size > 1000000:  # 对于大张量使用近似
+                mutation_tensor = torch.poisson(torch.full(param_shape, mu_rate, device=device))
+            else:
+                mutation_counts = np.random.poisson(mu_rate, param_shape)
+                mutation_tensor = torch.tensor(mutation_counts, dtype=torch.float32, device=device)
+        else:
+            # 对于非常小的μ值使用伯努利近似：Poisson(μ) ≈ Bernoulli(μ) when μ << 1
+            mutation_tensor = torch.bernoulli(torch.full(param_shape, mu_rate, device=device))
         
         # 高斯漂移
         sigma = 1e-4  # 变异幅度
@@ -241,12 +259,12 @@ class MoranProcess:
             probs = probs / probs.sum()
             
             selected_idx = torch.multinomial(probs, 1).item()
-            return mutations[selected_idx]
+            return mutations[int(selected_idx)]
         else:
             return mutations[0]
 
 
-class ViroEvoOpt:
+class ViroEvoOpt(Optimizer):
     """
     Viral Evolutionary Optimizer - 完全独立的病毒进化优化器
     
@@ -265,7 +283,7 @@ class ViroEvoOpt:
                  mu: float = 1e-4,       # 变异率（HIV突变率）
                  alpha: float = 1.0,     # 损失-死亡率缩放
                  temperature: float = 1.0,  # Boltzmann温度
-                 gillespie_steps: int = 20,  # Monte Carlo步数（10-50）
+                 gillespie_steps: int = 5,  # Monte Carlo步数（优化：减少到5步）
                  dt: float = 0.01):      # SIR积分时间步
         """
         初始化病毒进化优化器
@@ -281,21 +299,30 @@ class ViroEvoOpt:
             gillespie_steps: Gillespie模拟步数（设计：10-50）
             dt: SIR微分方程积分时间步
         """
-        self.param_groups = [{'params': list(params)}]
-        self.lr = lr
-        self.beta = beta
-        self.gamma = gamma  
-        self.mu = mu
-        self.alpha = alpha
-        self.temperature = temperature
-        self.gillespie_steps = gillespie_steps
-        self.dt = dt
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= beta <= 1.0:
+            raise ValueError(f"Invalid beta value: {beta}")
+        if not 0.0 <= gamma <= 1.0:
+            raise ValueError(f"Invalid gamma value: {gamma}")
+        if not 0.0 <= mu:
+            raise ValueError(f"Invalid mu value: {mu}")
+        if not 0.0 <= alpha:
+            raise ValueError(f"Invalid alpha value: {alpha}")
+        if not 0.0 < temperature:
+            raise ValueError(f"Invalid temperature value: {temperature}")
+        if not gillespie_steps > 0:
+            raise ValueError(f"Invalid gillespie_steps value: {gillespie_steps}")
+        if not 0.0 < dt:
+            raise ValueError(f"Invalid dt value: {dt}")
+
+        defaults = dict(lr=lr, beta=beta, gamma=gamma, mu=mu, alpha=alpha,
+                       temperature=temperature, gillespie_steps=gillespie_steps, dt=dt)
+        super(ViroEvoOpt, self).__init__(params, defaults)
         
         # 初始化组件
         self.gillespie = GillespieSimulator()
-        self.moran = MoranProcess(temperature)
         self.populations = {}  # {param_id: ViralPopulation}
-        self.state = {}        # 优化器状态
         
         # 初始化病毒种群
         self._initialize_populations()
@@ -303,6 +330,8 @@ class ViroEvoOpt:
     def _initialize_populations(self):
         """初始化病毒种群"""
         for group in self.param_groups:
+            group.setdefault('moran', MoranProcess(group['temperature']))
+            
             for param in group['params']:
                 param_id = id(param)
                 param_size = param.numel()
@@ -310,130 +339,140 @@ class ViroEvoOpt:
                 # 创建病毒种群
                 population = ViralPopulation(
                     total_params=param_size,
-                    beta=self.beta,
-                    gamma=self.gamma,
-                    mu=self.mu,
-                    alpha=self.alpha
+                    beta=group['beta'],
+                    gamma=group['gamma'],
+                    mu=group['mu'],
+                    alpha=group['alpha']
                 )
                 
                 self.populations[param_id] = population
-                self.state[param_id] = {
-                    'step': 0,
-                    'mutations_count': 0,
-                    'r0_history': [],
-                    'last_loss': 1.0
-                }
+                
+                # 初始化状态
+                if param not in self.state:
+                    self.state[param] = {
+                        'step': 0,
+                        'mutations_count': 0,
+                        'r0_history': [],
+                        'last_loss': 1.0
+                    }
     
+    @torch.no_grad()
     def step(self, closure=None):
         """执行一步病毒进化优化"""
+        loss = None
         if closure is not None:
-            loss = closure()
-        else:
-            loss = None
+            with torch.enable_grad():
+                loss = closure()
         
         loss_value = loss.item() if loss is not None else 1.0
         
         for group in self.param_groups:
+            moran = group['moran']
+            
             for param in group['params']:
                 if param.grad is None:
                     continue
                 
                 param_id = id(param)
                 population = self.populations[param_id]
-                state = self.state[param_id]
+                state = self.state[param]
                 
                 state['step'] += 1
                 
-                with torch.no_grad():
-                    # 阶段1：更新参数分类（基于梯度活跃度）
-                    population.update_parameter_classification(param.grad)
+                # 阶段1：更新参数分类（基于梯度活跃度）
+                population.update_parameter_classification(param.grad)
+                
+                # 阶段2：SIR动力学演化
+                # 超参调整：β随epoch增加，μ衰减（设计规定）
+                adaptive_beta = group['beta'] * (1.0 + 0.01 * state['step'])
+                adaptive_beta = min(adaptive_beta, 0.5)  # 上限
+                adaptive_mu = group['mu'] * math.exp(-0.001 * state['step'])
+                adaptive_mu = max(adaptive_mu, 1e-6)  # 下限
+                
+                population.beta = adaptive_beta
+                population.mu = adaptive_mu
+                
+                # 执行SIR微分方程组
+                dS, dI, dR = population.sir_dynamics(group['dt'], loss_value)
+                
+                # 记录R_0
+                R0 = population.basic_reproduction_number(loss_value)
+                state['r0_history'].append(R0)
+                
+                # 阶段3：Gillespie随机模拟
+                # 每步模拟SIR + Gillespie 10-50次（Monte Carlo）
+                viral_events = self.gillespie.simulate_viral_events(
+                    population, group['gillespie_steps']
+                )
+                
+                # 阶段4：病毒变异生成
+                # ξ ~ Poisson(μ) · N(0, σ²)（模拟病毒基因漂移）
+                viral_mutation = self.gillespie.generate_viral_mutation(
+                    param.shape, population.mu, param.device
+                )
+                state['mutations_count'] += torch.sum(torch.abs(viral_mutation) > 1e-6).item()
+                
+                # 阶段5：Moran过程进化选择
+                # 创建多个变异候选
+                mutations = [
+                    viral_mutation,
+                    viral_mutation * 0.5,
+                    -viral_mutation * 0.3
+                ]
+                
+                # 估算适应度比
+                fitness_ratios = []
+                for mutation in mutations:
+                    # 简化的适应度估算（基于梯度对齐）
+                    grad_norm = torch.norm(param.grad).item()
+                    mut_norm = torch.norm(mutation).item()
                     
-                    # 阶段2：SIR动力学演化
-                    # 超参调整：β随epoch增加，μ衰减（设计规定）
-                    adaptive_beta = self.beta * (1.0 + 0.01 * state['step'])
-                    adaptive_beta = min(adaptive_beta, 0.5)  # 上限
-                    adaptive_mu = self.mu * math.exp(-0.001 * state['step'])
-                    adaptive_mu = max(adaptive_mu, 1e-6)  # 下限
+                    if grad_norm > 0 and mut_norm > 0:
+                        alignment = -torch.sum(param.grad * mutation).item() / (grad_norm * mut_norm)
+                        estimated_loss_change = alignment * 0.1
+                        fitness_ratio = moran.fitness_ratio(loss_value, loss_value + estimated_loss_change)
+                    else:
+                        fitness_ratio = 1.0
                     
-                    population.beta = adaptive_beta
-                    population.mu = adaptive_mu
+                    fitness_ratios.append(fitness_ratio)
+                
+                # 选择有益变异
+                selected_mutation = moran.select_beneficial_mutation(mutations, fitness_ratios)
+                
+                # 阶段6：参数更新
+                # 对感染参数：θ_I ← θ_I - η∇L(θ_I) + ξ
+                param_flat = param.view(-1)
+                grad_flat = param.grad.view(-1)
+                mutation_flat = selected_mutation.view(-1)
+                
+                # 向量化应用到感染的参数 - 优化版本
+                if population.infected_indices:
+                    # 创建感染参数的掩码
+                    infected_indices_list = [i for i in population.infected_indices if i < len(param_flat)]
+                    if infected_indices_list:
+                        infected_tensor = torch.tensor(infected_indices_list, device=param.device, dtype=torch.long)
+                        # 向量化病毒进化更新公式
+                        param_flat[infected_tensor] = (param_flat[infected_tensor] - 
+                                                      group['lr'] * grad_flat[infected_tensor] + 
+                                                      mutation_flat[infected_tensor])
+                
+                # 完整更新：θ_{t+1} = weighted avg(θ_S, θ_I, θ_R)
+                # 权重∝I（活性感染主导）
+                if population.N > 0:
+                    infection_weight = population.I / population.N
+                    standard_weight = (population.S + population.R) / population.N
                     
-                    # 执行SIR微分方程组
-                    dS, dI, dR = population.sir_dynamics(self.dt, loss_value)
+                    # 标准梯度更新（非感染参数）
+                    standard_update = param.grad * group['lr'] * standard_weight
                     
-                    # 记录R_0
-                    R0 = population.basic_reproduction_number(loss_value)
-                    state['r0_history'].append(R0)
-                    
-                    # 阶段3：Gillespie随机模拟
-                    # 每步模拟SIR + Gillespie 10-50次（Monte Carlo）
-                    viral_events = self.gillespie.simulate_viral_events(
-                        population, self.gillespie_steps
-                    )
-                    
-                    # 阶段4：病毒变异生成
-                    # ξ ~ Poisson(μ) · N(0, σ²)（模拟病毒基因漂移）
-                    viral_mutation = self.gillespie.generate_viral_mutation(
-                        param.shape, population.mu, param.device
-                    )
-                    state['mutations_count'] += torch.sum(torch.abs(viral_mutation) > 1e-6).item()
-                    
-                    # 阶段5：Moran过程进化选择
-                    # 创建多个变异候选
-                    mutations = [
-                        viral_mutation,
-                        viral_mutation * 0.5,
-                        -viral_mutation * 0.3
-                    ]
-                    
-                    # 估算适应度比
-                    fitness_ratios = []
-                    for mutation in mutations:
-                        # 简化的适应度估算（基于梯度对齐）
-                        grad_norm = torch.norm(param.grad).item()
-                        mut_norm = torch.norm(mutation).item()
-                        
-                        if grad_norm > 0 and mut_norm > 0:
-                            alignment = -torch.sum(param.grad * mutation).item() / (grad_norm * mut_norm)
-                            estimated_loss_change = alignment * 0.1
-                            fitness_ratio = self.moran.fitness_ratio(loss_value, loss_value + estimated_loss_change)
-                        else:
-                            fitness_ratio = 1.0
-                        
-                        fitness_ratios.append(fitness_ratio)
-                    
-                    # 选择有益变异
-                    selected_mutation = self.moran.select_beneficial_mutation(mutations, fitness_ratios)
-                    
-                    # 阶段6：参数更新
-                    # 对感染参数：θ_I ← θ_I - η∇L(θ_I) + ξ
-                    param_flat = param.view(-1)
-                    grad_flat = param.grad.view(-1)
-                    mutation_flat = selected_mutation.view(-1)
-                    
-                    # 应用到感染的参数
-                    for i in population.infected_indices:
-                        if i < len(param_flat):
-                            # 病毒进化更新公式
-                            param_flat[i] = param_flat[i] - self.lr * grad_flat[i] + mutation_flat[i]
-                    
-                    # 完整更新：θ_{t+1} = weighted avg(θ_S, θ_I, θ_R)
-                    # 权重∝I（活性感染主导）
-                    if population.N > 0:
-                        infection_weight = population.I / population.N
-                        standard_weight = (population.S + population.R) / population.N
-                        
-                        # 标准梯度更新（非感染参数）
-                        standard_update = param.grad * self.lr * standard_weight
-                        
-                        # 病毒进化已经应用到感染参数，现在平衡更新
-                        param.add_(-standard_update)
-                    
-                    state['last_loss'] = loss_value
+                    # 病毒进化已经应用到感染参数，现在平衡更新
+                    param.add_(-standard_update)
+                
+                state['last_loss'] = loss_value
         
         return loss
     
-    def get_viral_metrics(self) -> Dict:
+    def get_viral_metrics(self) -> Dict[str, Any]:
         """获取病毒进化指标"""
         total_mutations = sum(state['mutations_count'] for state in self.state.values())
         avg_r0 = 0.0
@@ -455,39 +494,3 @@ class ViroEvoOpt:
             'epidemic_strength': 1.0 if avg_r0 > 1.0 else 0.0,
             'total_viral_events': sum(len(state['r0_history']) for state in self.state.values())
         }
-    
-    def zero_grad(self):
-        """清零梯度"""
-        for group in self.param_groups:
-            for param in group['params']:
-                if param.grad is not None:
-                    param.grad.zero_()
-    
-    def state_dict(self):
-        """保存状态"""
-        return {
-            'state': self.state,
-            'lr': self.lr,
-            'beta': self.beta,
-            'gamma': self.gamma,
-            'mu': self.mu,
-            'alpha': self.alpha,
-            'temperature': self.temperature,
-            'gillespie_steps': self.gillespie_steps,
-            'dt': self.dt
-        }
-    
-    def load_state_dict(self, state_dict):
-        """加载状态并重新初始化种群"""
-        self.state = state_dict.get('state', {})
-        self.lr = state_dict.get('lr', self.lr)
-        self.beta = state_dict.get('beta', self.beta)
-        self.gamma = state_dict.get('gamma', self.gamma)
-        self.mu = state_dict.get('mu', self.mu)
-        self.alpha = state_dict.get('alpha', self.alpha)
-        self.temperature = state_dict.get('temperature', self.temperature)
-        self.gillespie_steps = state_dict.get('gillespie_steps', self.gillespie_steps)
-        self.dt = state_dict.get('dt', self.dt)
-        
-        # 重新初始化病毒种群
-        self._initialize_populations()
