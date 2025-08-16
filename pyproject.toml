@@ -33,4 +33,4 @@ Homepage = "https://github.com/win10ogod/ChisatoOPT"
 "Bug Tracker" = "https://github.com/win10ogod/ChisatoOPT/issues"
 
 [tool.setuptools.packages.find]
-include = ["grokadamw*"]
+include = ["ChisatoOPT*"]
